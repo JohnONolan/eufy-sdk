@@ -135,8 +135,7 @@ export const LOCK_MEMBERS = {
     description: "Lock battery level 0-100 (verified: param 1101, alias 6001).",
   },
   /**
-   * Link quality in dBm as the lock measures it, on the shared param 1141. Both actuation methods here
-   * are fire-and-forget, so a weak link is silent rather than an error.
+   * Link quality in dBm as the lock measures it, on the shared param 1141.
    */
   rssi: {
     param: 1141,
@@ -147,14 +146,14 @@ export const LOCK_MEMBERS = {
     description: "Lock signal strength (verified: param 1141 = RSSI).",
   },
 
-  /** Lock the deadbolt/door. Fire-and-forget — rejects only on missing member identity, never on a device timeout. */
+  /** Lock the deadbolt/door. P2P completion requires acceptance; MQTT completion is submission only. Neither proves physical completion. */
   lock: method(
     ({ ctx, sink }) =>
       (): Promise<void> =>
         actuate(true, ctx, sink),
     "Lock the deadbolt/door.",
   ),
-  /** Unlock the deadbolt/door. Fire-and-forget — rejects only on missing member identity. */
+  /** Unlock the deadbolt/door. P2P completion requires acceptance; MQTT completion is submission only. Neither proves physical completion. */
   unlock: method(
     ({ ctx, sink }) =>
       (): Promise<void> =>
@@ -168,8 +167,8 @@ export const LOCK_MEMBERS = {
    * rest back verbatim. Works on both the T8531 video lock and the T85D0 garage/lock, which share the
    * identical settings frame; confirmed on-device in both directions on both families.
    *
-   * **Unlike `lock`/`unlock` this can reject on a device TIMEOUT**, not just missing identity — the GET
-   * step is a genuine precondition, so this one is not fire-and-forget.
+   * The GET is a required precondition and can reject or time out. The subsequent SET completes
+   * on submission; it does not wait for acceptance or state confirmation.
    */
   setAutoLock: method(
     ({ ctx, sink }) =>

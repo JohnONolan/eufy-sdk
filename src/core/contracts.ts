@@ -189,6 +189,43 @@ export class DeviceChannelUnresolvedError extends Error {
   }
 }
 
+/** Why a command could not complete its acceptance or response contract. */
+export type DeviceCommandFailureReason =
+  | "rejected"
+  | "send-failed"
+  | "disconnected"
+  | "correlation-unavailable"
+  | "invalid-response"
+  | "acceptance-timeout"
+  | "response-timeout";
+
+/**
+ * A command failed before its requested completion stage. A rejection preserves the peer's numeric
+ * code without inferring why it rejected the command. Acceptance is not physical completion.
+ */
+export class DeviceCommandError extends Error {
+  /** The command that was attempted, without its payload or authenticated identity. */
+  readonly command: number;
+  /** The resolved channel on which the command was attempted. */
+  readonly channel: number;
+
+  constructor(
+    /** Which completion stage failed. */
+    readonly reason: DeviceCommandFailureReason,
+    context: { command: number; channel: number },
+    /** The raw peer result, present only for an attributable rejection. */
+    readonly code?: number,
+  ) {
+    super(
+      `command ${context.command} on channel ${context.channel}: ${reason}` +
+        (code === undefined ? "" : ` (device result ${code})`),
+    );
+    this.name = "DeviceCommandError";
+    this.command = context.command;
+    this.channel = context.channel;
+  }
+}
+
 /**
  * Why {@link MediaProvider.downloadRecording} returned no recording.
  *

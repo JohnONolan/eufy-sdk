@@ -44,6 +44,7 @@ interface FakeSession extends FakeP2PSession {
 
 function makeRouter(plain: Buffer, opts: { noReply?: boolean } = {}) {
   const session = connectedSession() as FakeSession;
+  Object.assign(session, { connect: vi.fn(async () => {}), close: vi.fn(async () => {}) });
   let getCount = 0;
   session.sendControlLevel2 = vi.fn((_cmd, _channel, _accountId, payload) => {
     const p = payload as { apiCommand: number; time: number };
@@ -53,6 +54,8 @@ function makeRouter(plain: Buffer, opts: { noReply?: boolean } = {}) {
         const lockPayload = buildResponseFrame(plain, p.time);
         queueMicrotask(() => {
           session.emit("data", {
+            channel: 1,
+            commandId: 1351,
             json: {
               cmd: CMD_TRANSFER_PAYLOAD,
               payload: { dev_sn: SN, lock_payload: lockPayload, time: p.time.toString(16) },
@@ -76,6 +79,7 @@ function makeRouter(plain: Buffer, opts: { noReply?: boolean } = {}) {
   };
   const router = new P2PCommandRouter(deps);
   (router as unknown as { manager: { register(sn: string, s: unknown): void } }).manager.register(STATION_SN, session);
+  vi.spyOn(router as any, "createSession").mockResolvedValue(session);
   return router;
 }
 
@@ -127,7 +131,7 @@ describe("P2PCommandRouter.getAutoLockState (ff09-p2p read-only GET)", () => {
     const plain = buildResponsePlain({ enabled: true, delaySeconds: 1, isSchedule: false, start: [0, 0], end: [0, 0] });
     const router = makeRouter(plain, { noReply: true });
     const p = router.getAutoLockState(SN, { adminUserId: ADMIN, deviceSn: SN });
-    const assertion = expect(p).rejects.toThrow(/no settings GET reply/);
+    const assertion = expect(p).rejects.toThrow(/acceptance-timeout/);
     await vi.advanceTimersByTimeAsync(15000);
     await assertion;
   });

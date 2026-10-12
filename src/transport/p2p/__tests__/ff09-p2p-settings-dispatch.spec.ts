@@ -76,6 +76,7 @@ function makeRouter(opts: {
 }) {
   const calls: Call[] = [];
   const session = connectedSession() as FakeSession;
+  Object.assign(session, { connect: vi.fn(async () => {}), close: vi.fn(async () => {}) });
   session.sendControlLevel2 = vi.fn((cmd, channel, _accountId, payload) => {
     const p = payload as Call["payload"];
     calls.push({ cmd, channel, payload: p });
@@ -88,6 +89,8 @@ function makeRouter(opts: {
       const lockPayload = buildResponseFrame(plain, p.time);
       queueMicrotask(() => {
         session.emit("data", {
+          channel: 1,
+          commandId: 1351,
           json: {
             cmd: CMD_TRANSFER_PAYLOAD,
             payload: {
@@ -114,6 +117,7 @@ function makeRouter(opts: {
   };
   const router = new P2PCommandRouter(deps);
   (router as unknown as { manager: { register(sn: string, s: unknown): void } }).manager.register(STATION_SN, session);
+  vi.spyOn(router as any, "createSession").mockResolvedValue(session);
   return { router, calls, session };
 }
 
@@ -210,7 +214,7 @@ describe("P2PCommandRouter.sendFf09Autolock (ff09-autolock command-router branch
       deviceSn: SN,
       enabled: true,
     });
-    const assertion = expect(p).rejects.toThrow(/no settings GET reply/);
+    const assertion = expect(p).rejects.toThrow(/acceptance-timeout/);
     await vi.advanceTimersByTimeAsync(15000);
     await assertion;
   });

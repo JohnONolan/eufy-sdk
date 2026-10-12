@@ -343,6 +343,15 @@ export interface P2PFrame extends P2PDataFrameHeader {
   params?: Record<number, string>;
 }
 
+/** The defensive result decoder's numeric result and frame context. @internal */
+export interface P2PCommandResult {
+  code: number;
+  channel: number;
+  commandId: number;
+  dataType: number;
+  type: number;
+}
+
 /** Per-process counter behind {@link P2PSession.traceId} — see it for why this is not a serial. */
 let traceSequence = 0;
 
@@ -2278,7 +2287,13 @@ export class P2PSession extends EventEmitter {
       data.length === PADDED_RESULT_BYTES &&
       data.subarray(4).every((b) => b === 0);
     if (!isMedia && !frame.json && (data.length === 4 || paddedResult)) {
-      this.emit("commandResult", { code: data.readInt32LE(0), channel: header.channel });
+      this.emit("commandResult", {
+        code: data.readInt32LE(0),
+        channel: header.channel,
+        commandId: header.commandId,
+        dataType,
+        type: header.type,
+      } satisfies P2PCommandResult);
     }
     this.emit("data", frame);
   }

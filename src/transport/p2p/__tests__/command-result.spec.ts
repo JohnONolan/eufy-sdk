@@ -9,10 +9,10 @@ const P2P_DID = "XXXXXXX-000000-XXXXX";
  */
 const results = (commandId: number, body: Buffer, signCode = 0) => {
   const session = new P2PSession({ stationSn: STATION_SN, p2pDid: P2P_DID });
-  const seen: { code: number; channel: number }[] = [];
+  const seen: unknown[] = [];
   session.on("commandResult", (r) => seen.push(r));
   (session as unknown as { handleFrame(h: unknown, p: Buffer, d: number): void }).handleFrame(
-    { commandId, channel: 0, signCode, bytesToRead: body.length },
+    { commandId, channel: 0, signCode, bytesToRead: body.length, type: 1 },
     body,
     0,
   );
@@ -34,25 +34,28 @@ const code = (value: number) => {
 };
 
 describe("P2P frame — command result", () => {
+  it("retains the exact result class metadata without inventing a request sequence", () => {
+    expect(results(1350, padded(-106))).toEqual([{ code: -106, channel: 0, commandId: 1350, dataType: 0, type: 1 }]);
+  });
   it("reads the result of a media command, sent over CMD_SET_PAYLOAD", () => {
-    expect(results(1350, code(0))).toEqual([{ code: 0, channel: 0 }]);
+    expect(results(1350, code(0))).toMatchObject([{ code: 0, channel: 0 }]);
   });
 
   it("reads the result of a device-control command, sent over CMD_CONTROL_PAYLOAD", () => {
     // The two wrappers answer identically, and only 1350 was read: a station refusing a control
     // command reached the caller as silence, which is also what an unanswered send looks like.
-    expect(results(1700, code(-108))).toEqual([{ code: -108, channel: 0 }]);
+    expect(results(1700, code(-108))).toMatchObject([{ code: -108, channel: 0 }]);
   });
 
   it("carries a failure code through as it arrives, negative and unmapped", () => {
-    expect(results(1350, code(-104))).toEqual([{ code: -104, channel: 0 }]);
+    expect(results(1350, code(-104))).toMatchObject([{ code: -104, channel: 0 }]);
   });
 
   it("reads the result of a direct command, which is no wrapper at all", () => {
     // 1246 is the param id itself carrying a direct-binary body, and it answers with four bytes just
     // as the wrappers do. An allowlist of wrappers would leave exactly the writes that have no other
     // confirmation path reporting nothing.
-    expect(results(1246, code(0))).toEqual([{ code: 0, channel: 0 }]);
+    expect(results(1246, code(0))).toMatchObject([{ code: 0, channel: 0 }]);
   });
 
   it("reports nothing for a media frame, whose body is never control plaintext", () => {
@@ -87,11 +90,11 @@ describe("P2P frame — command result", () => {
     // nothing but zero padding. The body is not block-aligned, so the level-1 decrypt skips it and it
     // arrives raw — under a strict four-byte test the lock's own rejection was dropped and read as
     // silence, which is the one answer it never gives.
-    expect(results(1350, padded(-110), 1)).toEqual([{ code: -110, channel: 0 }]);
+    expect(results(1350, padded(-110), 1)).toMatchObject([{ code: -110, channel: 0 }]);
   });
 
   it("reads a zero-padded success the same way", () => {
-    expect(results(1350, padded(0), 1)).toEqual([{ code: 0, channel: 0 }]);
+    expect(results(1350, padded(0), 1)).toMatchObject([{ code: 0, channel: 0 }]);
   });
 
   it("still reports nothing when the padding is not zeros", () => {

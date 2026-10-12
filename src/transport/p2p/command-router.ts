@@ -27,6 +27,7 @@ import type {
 } from "../../core/contracts.js";
 import {
   DeviceChannelUnresolvedError,
+  DeviceCommandError,
   RecordingDownloadError,
   StationKeyUnavailableError,
   StationUnreachableError,
@@ -35,6 +36,7 @@ import { noopLogger, type Logger } from "../../core/logger.js";
 import { assertNever } from "../../core/util.js";
 import { setTimeout as sleep } from "node:timers/promises";
 import { CONNECT_TIMEOUT_MS, P2PSession, type P2PFrame } from "./p2p-session.js";
+import { requestControlPayload } from "./command-request.js";
 import { buildDirectBinaryBody } from "./write-commands.js";
 import { CommandType } from "./commands.js";
 import {
@@ -48,6 +50,7 @@ import {
   ff09ReplyKeyTime,
   ff09TransferPayload,
   CMD_TRANSFER_PAYLOAD,
+  LOCK_COMMAND_CODE,
 } from "../ff09.js";
 import { decodeP2PCloudIPs } from "./codec.js";
 import { P2P_ENVELOPE } from "./envelope.js";
@@ -93,13 +96,27 @@ const DIRECT_CMD_SENDS = 5;
  */
 function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return work;
-  signal.throwIfAborted();
-  return Promise.race([
-    work,
-    new Promise<never>((_resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    }),
-  ]);
+  if (signal.aborted) {
+    void work.catch(() => {});
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -287,6 +304,14 @@ export interface P2PRouterDeps {
 export class P2PCommandRouter {
   /** P2P session lifecycle: on-demand open + battery-aware idle-detach + refcount, per session key. */
   private readonly manager: SessionManager;
+  /** Private command connections, never shared with media or another command phase. */
+  private readonly commandSessions = new Set<P2PSession>();
+  /** Station-local command ownership; settled requests release the next reservation. */
+  private readonly commandTails = new Map<string, Promise<void>>();
+  /** Closing the router invalidates active and queued command phases. */
+  private commandLifetime = new AbortController();
+  /** Used query key timestamps remain reserved across terminal outcomes and clock changes. */
+  private readonly settingsQueryTimes = new Map<string, Set<number>>();
   /** Error objects already forwarded while a station startup awaits the same session signal. */
   private readonly reportedErrors = new WeakSet<Error>();
   /** One shared live source per `${parentSn}:${channel}` — collapses N live() calls to one pull. */
@@ -394,6 +419,9 @@ export class P2PCommandRouter {
 
   /** Close every P2P session and drop them. */
   async closeAll(): Promise<void> {
+    this.commandLifetime.abort();
+    this.commandLifetime = new AbortController();
+    await Promise.all([...this.commandSessions].map((session) => session.close()));
     const talking = [...this.talkbacks.values()];
     this.talkbacks.clear();
     await Promise.all(talking.map((t) => t.stop().catch(() => {})));
@@ -492,25 +520,99 @@ export class P2PCommandRouter {
     return this.manager.acquire(
       key,
       async (register) => {
-        const stationDev = this.recordFor(parentSn);
-        if (!stationDev) throw new Error(`station ${parentSn} is not in the device list`);
-        const raw = (stationDev.raw ?? {}) as Record<string, any>;
-        const did = (stationDev.p2pDid ?? raw.p2p_did) as string | undefined;
-        if (!did) throw new Error(`no P2P endpoint (p2p_did) for station ${parentSn}`);
-        let dskKey: string | undefined;
-        try {
-          dskKey = (await this.deps.mega.getDskKeys([parentSn]))[parentSn]?.dskKey;
-        } catch (e) {
-          this.deps.onError(e instanceof Error ? e : new Error(String(e)));
-        }
-        const localAddress = this.deps.localAddresses?.[parentSn] ?? freshestLanIp(raw);
-        const session = this.makeSession(parentSn, did, raw, dskKey, localAddress, key, key === parentSn);
+        const session = await this.createSession(parentSn, key, key === parentSn);
         register(session);
         await session.connect();
         return session;
       },
       parentSn,
     );
+  }
+
+  /** Construct an unconnected session with the station's endpoint and key resolver. */
+  private async createSession(parentSn: string, key: string, announces: boolean): Promise<P2PSession> {
+    const stationDev = this.recordFor(parentSn);
+    if (!stationDev) throw new Error(`station ${parentSn} is not in the device list`);
+    const raw = (stationDev.raw ?? {}) as Record<string, any>;
+    const did = (stationDev.p2pDid ?? raw.p2p_did) as string | undefined;
+    if (!did) throw new Error(`no P2P endpoint (p2p_did) for station ${parentSn}`);
+    let dskKey: string | undefined;
+    try {
+      dskKey = (await this.deps.mega.getDskKeys([parentSn]))[parentSn]?.dskKey;
+    } catch (e) {
+      this.deps.onError(e instanceof Error ? e : new Error(String(e)));
+    }
+    const localAddress = this.deps.localAddresses?.[parentSn] ?? freshestLanIp(raw);
+    return this.makeSession(parentSn, did, raw, dskKey, localAddress, key, announces);
+  }
+
+  /**
+   * Exclusive ownership of one ambiguous SET_PAYLOAD phase. Each reservation gets a fresh socket;
+   * closing it on every outcome prevents replies from an earlier phase reaching a later waiter.
+   * Only the gateway handshake and transport heartbeat share this socket. Device results must remain
+   * confined to their sending connection; this is observed on a HomeBase 3 attached video lock.
+   */
+  private async withCommandSession<T>(
+    resolved: ResolvedSession,
+    work: (session: P2PSession, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const signal = this.commandLifetime.signal;
+    const previous = this.commandTails.get(resolved.parentSn) ?? Promise.resolve();
+    let release!: () => void;
+    const reservation = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => reservation);
+    this.commandTails.set(resolved.parentSn, tail);
+    let session: P2PSession | undefined;
+    const disconnected = new AbortController();
+    const phaseSignal = AbortSignal.any([signal, disconnected.signal]);
+    const onClose = () =>
+      disconnected.abort(
+        new DeviceCommandError("disconnected", { command: CMD_TRANSFER_PAYLOAD, channel: resolved.channel }),
+      );
+    const onError = () =>
+      disconnected.abort(
+        new DeviceCommandError("send-failed", { command: CMD_TRANSFER_PAYLOAD, channel: resolved.channel }),
+      );
+    try {
+      await abortable(previous, signal);
+      signal.throwIfAborted();
+      session = await this.createSession(resolved.parentSn, "", false);
+      signal.throwIfAborted();
+      this.commandSessions.add(session);
+      session.once("close", onClose);
+      session.once("error", onError);
+      await abortable(session.connect(), phaseSignal);
+      const start = Date.now();
+      while (!session.isConnected && Date.now() - start < P2P_STATION_WAITS.connect) {
+        phaseSignal.throwIfAborted();
+        await abortable(sleep(200), phaseSignal);
+      }
+      phaseSignal.throwIfAborted();
+      if (!session.isConnected) throw new StationUnreachableError(resolved.parentSn, Date.now() - start);
+      let ready = await abortable(session.awaitLevel2Key(LEVEL2_GRACE_MS, "call"), phaseSignal);
+      if (!ready && session.repromptLevel2Key())
+        ready = await abortable(session.awaitLevel2Key(LEVEL2_GRACE_MS, "call"), phaseSignal);
+      phaseSignal.throwIfAborted();
+      if (!ready) throw new StationKeyUnavailableError(resolved.parentSn);
+      return await work(session, phaseSignal);
+    } catch (error) {
+      if (signal.aborted)
+        throw new DeviceCommandError("disconnected", { command: CMD_TRANSFER_PAYLOAD, channel: resolved.channel });
+      if (disconnected.signal.aborted) throw disconnected.signal.reason;
+      throw error;
+    } finally {
+      try {
+        session?.off("close", onClose);
+        session?.off("error", onError);
+        if (session) await session.close();
+      } finally {
+        if (session) this.commandSessions.delete(session);
+        release();
+        if (this.commandTails.get(resolved.parentSn) === tail) this.commandTails.delete(resolved.parentSn);
+      }
+    }
   }
 
   /**
@@ -1824,6 +1926,8 @@ export class P2PCommandRouter {
    * (`{apiCommand, lock_payload, seq_num, time}`) as a `set-payload` (1350), `mValue3=0`, on the lock's
    * device channel. This is the P2P envelope; the capability module only supplies identity, never wire
    * bytes and never the routing channel — that's re-resolved here from the device record.
+   * Submits once on a private connection and resolves only on device acceptance. Transport ACKs
+   * do not satisfy this wait, and acceptance does not synthesize state or prove physical completion.
    */
   private async sendFf09Actuate(sn: string, cmd: Ff09Identity): Promise<void> {
     const resolved = await this.resolveSession(sn, { waitLevel2: true });
@@ -1834,54 +1938,36 @@ export class P2PCommandRouter {
       shortUserId: cmd.shortUserId,
       deviceSn: cmd.deviceSn,
     });
-    await this.sendSetPayloadEnvelope(
-      sn,
-      CMD_TRANSFER_PAYLOAD,
-      ff09TransferPayload(frame),
-      resolved.channel,
-      0,
-      resolved,
+    await this.withCommandSession(resolved, (session, signal) =>
+      requestControlPayload(session, {
+        command: CMD_TRANSFER_PAYLOAD,
+        channel: resolved.channel,
+        signal,
+        send: () =>
+          session.sendControlLevel2(
+            CMD_TRANSFER_PAYLOAD,
+            resolved.channel,
+            resolved.accountId,
+            ff09TransferPayload(frame),
+            0,
+          ),
+        timeoutMs: P2PCommandRouter.FF09_SETTINGS_GET_TIMEOUT_MS,
+        maxSends: 1,
+        retryMs: 200,
+      }),
     );
   }
 
   /**
-   * How long {@link sendFf09Autolock} waits for the device's settings **GET** reply before
-   * giving up. Unlike the MQTT sibling (`MqttCommandRouter.dispatchFf09Autolock`, one TCP publish), the P2P
-   * GET is replayed `DIRECT_CMD_SENDS`× over ~800ms by {@link sendSetPayloadEnvelope} for RF
-   * resilience before this wait even starts counting down the rest — so the budget only needs to cover
-   * the reply's own travel time, not the resend window.
+   * Deadline from the first submission through acceptance and the requested settings payload.
    */
   private static readonly FF09_SETTINGS_GET_TIMEOUT_MS = 10000;
 
   /**
-   * **`ff09-autolock` intent over P2P** — read-modify-write the T8531's auto-lock setting. The
-   * P2P sibling of `MqttCommandRouter.dispatchFf09Autolock`; same GET-then-SET shape, same `ff09`
-   * frame/cipher. ✅ LIVE-VERIFIED end-to-end (2026-07-18): `dev.lock()?.setAutoLock(false)` THEN
-   * `setAutoLock(true)` driven through this exact codepath against a real T8531, both directions
-   * confirmed via the app UI showing autolock off then on afterward — not just byte-exact against a
-   * capture. Differs from the MQTT flow only in the envelope + reply matching:
-   *
-   * Resolves the session ONCE up front (needed to arm the reply listener before sending) and passes it
-   * to both `sendSetPayloadEnvelope` calls (GET + SET) — skips the redundant re-resolve each would
-   * otherwise do internally (see {@link replayLevel2Send}'s doc).
-   *
-   *  1. Build the settings GET frame ({@link buildFf09QueryFrame}) and send it the same way
-   *     `sendFf09Actuate` sends a lock/unlock — a `1940` TRANSFER_PAYLOAD `set-payload` (1350) on the
-   *     lock's device channel. Arm a `session.on("data", …)` listener BEFORE sending (same
-   *     arm-before-send ordering as {@link p2pQuery}), matching the reply by `f.json.cmd ===
-   *     CMD_TRANSFER_PAYLOAD` (the device's `/res`-equivalent reply always carries this inner cmd,
-   *     same as any other transfer-payload traffic on this channel — so `cmd` alone isn't enough) AND
-   *     `f.json.payload.time` equal to the GET's own `time`. **Confirmed live (2026-07-17) against a
-   *     real T8531 capture: the P2P reply's `time` field is a HEX STRING** (e.g. `"6A5908BD"`),
-   *     identical to the MQTT reply's convention — NOT the decimal the outbound `time` field uses. No
-   *     reply within {@link FF09_SETTINGS_GET_TIMEOUT_MS} throws (same rationale as the MQTT side:
-   *     guessing A7/A8 would be worse than failing loud).
-   *  2+3. Decrypt the reply, preserve the current delay (`a2`) + `A7`/`A8` passthrough values (`a4`/
-   *     `a5`), and build the SET frame — the decrypt→read→rebuild shared with the MQTT sibling as
-   *     `transport/ff09.ts`'s {@link buildFf09AutolockSetFrame} — then send it the same fire-and-forget
-   *     way as `sendFf09Actuate` (no ack wait, matching every other P2P write in this router; there is no
-   *     `commandAck` event plumbing at this layer — that's an `EufyMega`-level concern the MQTT
-   *     dispatcher happens to have because it owns its own MQTT connection lifecycle).
+   * Read-modify-write the auto-lock setting. The GET uses a fresh private connection and requires
+   * its timestamp-matched settings payload. The SET preserves the current delay and A7/A8 via
+   * {@link buildFf09AutolockSetFrame}, then uses the shared submission-only write path.
+   * The settings wire was verified on a T8531; this completion contract does not wait for SET acceptance.
    */
   private async sendFf09Autolock(
     sn: string,
@@ -1894,19 +1980,21 @@ export class P2PCommandRouter {
   ): Promise<void> {
     const resolved = await this.resolveSession(sn, { waitLevel2: true });
 
-    // ── 1. GET current settings, matched back by keyTime (shared with getAutoLockState — see helper). ──
-    const getReply = await this.fetchFf09SettingsGetReply(sn, cmd, resolved);
+    const getReply = await this.fetchFf09SettingsGetReply(cmd, resolved);
 
-    // ── 2+3. Decrypt the reply, preserve A7/A8 + delay, build the SET frame (shared with the MQTT
-    //         sibling — see buildFf09AutolockSetFrame), then send it fire-and-forget. ──────────────
-    const setFrame = buildFf09AutolockSetFrame({
-      lockPayload: getReply.lockPayload,
-      keyTime: getReply.keyTime,
-      adminUserId: cmd.adminUserId,
-      deviceSn: cmd.deviceSn,
-      enabled: cmd.enabled,
-      delaySeconds: cmd.delaySeconds,
-    });
+    let setFrame: ReturnType<typeof buildFf09AutolockSetFrame>;
+    try {
+      setFrame = buildFf09AutolockSetFrame({
+        lockPayload: getReply.lockPayload,
+        keyTime: getReply.keyTime,
+        adminUserId: cmd.adminUserId,
+        deviceSn: cmd.deviceSn,
+        enabled: cmd.enabled,
+        delaySeconds: cmd.delaySeconds,
+      });
+    } catch {
+      throw new DeviceCommandError("invalid-response", { command: CMD_TRANSFER_PAYLOAD, channel: resolved.channel });
+    }
     await this.sendSetPayloadEnvelope(
       sn,
       CMD_TRANSFER_PAYLOAD,
@@ -1918,68 +2006,62 @@ export class P2PCommandRouter {
   }
 
   /**
-   * Shared GET-and-wait step behind both {@link sendFf09Autolock} (which reads to preserve A7/A8 across
-   * a write) and {@link getAutoLockState} (which reads for its own sake) — extracted so the two don't
-   * drift on the arm-before-send / listener-leak / keyTime-matching machinery. Arms a
-   * `session.on("data", …)` listener BEFORE sending the GET (same ordering as {@link p2pQuery}); the
-   * `cleanup`/`onData`/`timer` are hoisted out of the Promise executor so the try/catch can tear the
-   * listener down if the send itself throws (without it a send failure would leak `onData` on the
-   * long-lived shared session for the full timeout window). Matches the reply by inner
-   * `cmd === CMD_TRANSFER_PAYLOAD` AND `payload.time` (a hex string live) equal to the GET's own
-   * keyTime. Throws if no matching reply arrives within {@link FF09_SETTINGS_GET_TIMEOUT_MS}.
+   * Settings GET on a private command connection. A matching DATA result rejects immediately;
+   * acceptance alone still requires inner TRANSFER_PAYLOAD, the resolved channel, and the query's
+   * key timestamp. Malformed attributed frames reject as invalid-response. Read retries stop on
+   * acceptance, a payload, or a terminal failure.
    */
   private async fetchFf09SettingsGetReply(
-    sn: string,
     cmd: { adminUserId: string; deviceSn: string },
     resolved: ResolvedSession,
   ): Promise<{ lockPayload: string; keyTime: number }> {
-    const { session } = resolved;
-    const query = buildFf09QueryFrame({ adminUserId: cmd.adminUserId, deviceSn: cmd.deviceSn });
-    let onData!: (f: P2PFrame) => void;
-    let timer!: ReturnType<typeof setTimeout>;
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      session.off("data", onData);
-    };
-    const getReplyPromise = new Promise<{ lockPayload: string; keyTime: number } | undefined>((resolve) => {
-      onData = (f: P2PFrame): void => {
-        const j = f.json as { cmd?: number; payload?: Record<string, unknown> } | undefined;
-        if (j?.cmd !== CMD_TRANSFER_PAYLOAD || !j.payload) return;
-        const rawTime = j.payload.time;
-        const lockPayload = j.payload.lock_payload;
-        if (typeof lockPayload !== "string" || (typeof rawTime !== "string" && typeof rawTime !== "number")) return;
-        const keyTime = ff09ReplyKeyTime(rawTime);
-        if (keyTime === undefined || keyTime !== query.time) return; // other traffic — keep waiting
-        cleanup();
-        resolve({ lockPayload, keyTime });
-      };
-      timer = setTimeout(() => {
-        cleanup();
-        resolve(undefined);
-      }, P2PCommandRouter.FF09_SETTINGS_GET_TIMEOUT_MS);
-      session.on("data", onData);
+    return this.withCommandSession(resolved, (session, signal) => {
+      const query = buildFf09QueryFrame({ adminUserId: cmd.adminUserId, deviceSn: cmd.deviceSn });
+      const used = this.settingsQueryTimes.get(resolved.parentSn) ?? new Set<number>();
+      if (used.has(query.time))
+        throw new DeviceCommandError("correlation-unavailable", {
+          command: CMD_TRANSFER_PAYLOAD,
+          channel: resolved.channel,
+        });
+      used.add(query.time);
+      this.settingsQueryTimes.set(resolved.parentSn, used);
+      return requestControlPayload(session, {
+        command: CMD_TRANSFER_PAYLOAD,
+        channel: resolved.channel,
+        signal,
+        send: () =>
+          session.sendControlLevel2(
+            CMD_TRANSFER_PAYLOAD,
+            resolved.channel,
+            resolved.accountId,
+            ff09TransferPayload(query),
+            0,
+          ),
+        timeoutMs: P2PCommandRouter.FF09_SETTINGS_GET_TIMEOUT_MS,
+        maxSends: DIRECT_CMD_SENDS,
+        retryMs: 200,
+        readReply: (f) => {
+          const j = f.json as { cmd?: number; payload?: Record<string, unknown> } | undefined;
+          if (f.commandId !== CommandType.CMD_NOTIFY_PAYLOAD || j?.cmd !== CMD_TRANSFER_PAYLOAD || !j.payload) return;
+          const rawTime = j.payload.time;
+          if (typeof rawTime !== "string" && typeof rawTime !== "number") return;
+          const keyTime = ff09ReplyKeyTime(rawTime);
+          if (keyTime === undefined || keyTime !== query.time) return;
+          if (typeof j.payload.lock_payload !== "string") throw new Error("settings response has no lock payload");
+          const body = Buffer.from(j.payload.lock_payload, "hex");
+          if (body.length >= 9 && body[8] !== LOCK_COMMAND_CODE.GET_SETTINGS) return;
+          parseFf09SettingsResponse(
+            decryptFf09Frame({
+              lockPayload: j.payload.lock_payload,
+              keyTime,
+              adminUserId: cmd.adminUserId,
+              deviceSn: cmd.deviceSn,
+            }),
+          );
+          return { lockPayload: j.payload.lock_payload, keyTime };
+        },
+      });
     });
-    try {
-      await this.sendSetPayloadEnvelope(
-        sn,
-        CMD_TRANSFER_PAYLOAD,
-        ff09TransferPayload(query),
-        resolved.channel,
-        0,
-        resolved,
-      );
-    } catch (e) {
-      cleanup();
-      throw e;
-    }
-    const getReply = await getReplyPromise;
-    if (!getReply) {
-      throw new Error(
-        `fetchFf09SettingsGetReply(${sn}): no settings GET reply within ` +
-          `${P2PCommandRouter.FF09_SETTINGS_GET_TIMEOUT_MS}ms.`,
-      );
-    }
-    return getReply;
   }
 
   /**
@@ -1994,25 +2076,29 @@ export class P2PCommandRouter {
    */
   async getAutoLockState(sn: string, cmd: { adminUserId: string; deviceSn: string }): Promise<AutoLockSnapshot> {
     const resolved = await this.resolveSession(sn, { waitLevel2: true });
-    const getReply = await this.fetchFf09SettingsGetReply(sn, cmd, resolved);
-    return decodeFf09AutoLockSnapshot(
-      parseFf09SettingsResponse(
-        decryptFf09Frame({
-          lockPayload: getReply.lockPayload,
-          keyTime: getReply.keyTime,
-          adminUserId: cmd.adminUserId,
-          deviceSn: cmd.deviceSn,
-        }),
-      ),
-    );
+    const getReply = await this.fetchFf09SettingsGetReply(cmd, resolved);
+    try {
+      return decodeFf09AutoLockSnapshot(
+        parseFf09SettingsResponse(
+          decryptFf09Frame({
+            lockPayload: getReply.lockPayload,
+            keyTime: getReply.keyTime,
+            adminUserId: cmd.adminUserId,
+            deviceSn: cmd.deviceSn,
+          }),
+        ),
+      );
+    } catch {
+      throw new DeviceCommandError("invalid-response", { command: CMD_TRANSFER_PAYLOAD, channel: resolved.channel });
+    }
   }
 
   /**
    * **`ff09-setting-toggle` intent** — the COMPACT single-setting `SET_SETTINGS` write (currently:
    * T8531 Rain Mode, `settingId` = `ff09.ts`'s `FF09_SETTING_ID.RAIN_MODE`). Unlike
    * {@link sendFf09Autolock}, this is a pure blind write — no GET pass, no reply wait — since the
-   * compact frame ({@link buildFf09SettingToggleFrame}) only carries the one field being changed, same
-   * fire-and-forget shape as {@link sendFf09Actuate}. ✅ LIVE-VERIFIED end-to-end (2026-07-18):
+   * compact frame ({@link buildFf09SettingToggleFrame}) only carries the one field being changed, a
+   * submission-only completion contract. ✅ LIVE-VERIFIED end-to-end (2026-07-18):
    * `dev.lock()?.setRainMode()` driven through this exact codepath against a real T8531, both
    * directions confirmed via the app UI showing the new state afterward — not just byte-exact against a
    * capture. See `transport/ff09.ts`'s "Rain Mode" doc section. The routing channel is re-resolved from

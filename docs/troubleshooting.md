@@ -142,6 +142,38 @@ carries `retryAfterMs`, and every login you spend — not only the SDK's own —
 the error says the token is being displaced by another client rather than expiring, which no re-login
 fixes.
 
+## 7. P2P command rejection and completion
+
+The P2P ff09 settings GET (`getAutoLockState`, also the read step of `setAutoLock`) and ff09
+actuation (`lock`/`unlock`) propagate `DeviceCommandError` with stable `reason`, `command`, `channel`
+and optional numeric `code` fields. `rejected` reports the raw device result without inferring its
+cause: a rejection does not establish that a device is absent or offline.
+
+`send-failed` means no submission succeeded; `disconnected` invalidates the request's connection.
+`acceptance-timeout` means no acceptance or requested payload was received before the deadline;
+`response-timeout` means acceptance arrived but the requested payload did not. An attributable
+malformed response reports `invalid-response`. `correlation-unavailable` refuses a settings GET whose
+key timestamp was already used on that station: broadcast payloads must not match an earlier query.
+Used timestamps remain reserved for the router lifetime, including across clock changes. Transport ACKs alone cannot complete either operation.
+
+Actuation submits once and resolves on device acceptance. It does not update lock state or prove
+physical completion. Settings GET requires the actual timestamp-matched payload, even after result
+zero. Read retries stop on acceptance or any terminal outcome.
+
+These operations use a fresh private connection for each phase, serialized per station. The result
+has no echoed inner command or request sequence, so the private connection supplies ownership;
+incoming sequence numbers are not treated as outgoing request identifiers. Connections close on
+success and failure, preventing a retired request's result from settling a successor. This requires
+an extra connection handshake and relies on device results remaining confined to their sending
+connection, observed in read-only captures on a T8530/S330 attached to a T8030/HomeBase 3. Other
+firmware and topologies have not been verified for this isolation behavior. The settings payload also
+requires the GET response opcode. Timestamp reservations cover this router's reads; another client's
+simultaneous GET with the same timestamp is outside that ownership boundary.
+
+The auto-lock SET, compact settings toggles, other P2P command families and MQTT retain their existing
+completion contracts. A completed settings write can still mean submission only. This change does
+not add a native lock protocol or physical state confirmation.
+
 ## Still stuck?
 
 Re-run with `new ConsoleLogger("debug")`, capture the `error` output, and check the behavior against
